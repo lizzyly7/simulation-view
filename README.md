@@ -46,6 +46,6 @@ MIT License applies to the visible parts.
 
 ## 📩 Feedback & Suggestions
 
-Feel free to [open an issue]([https://github.com/](https://github.com/lizzyly7/simulation-view/issues)) to report bugs or suggest improvements.
+Feel free to [open an issue](https://github.com/lizzyly7/simulation-view/issues) to report bugs or suggest improvements.
 
 感谢支持！欢迎提出宝贵意见 😊
