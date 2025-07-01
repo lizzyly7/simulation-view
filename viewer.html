@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+
+<html lang="zh">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>WebGL2 MSH Viewer - Streaming Parser</title>
+<style>
+    body { margin: 0; display: flex; flex-direction: column; align-items: center; font-family: sans-serif; background-color: #f0f0f0; color: #333; line-height: 1.6; }
+    #controlsContainer { margin: 20px; padding: 20px; border: 1px solid #ccc; background-color: #fff; box-shadow: 0 2px 10px rgba(0,0,0,0.1); border-radius: 8px; width: 90%; max-width: 800px; }
+    h2 { margin-top: 0; color: #0056b3; }
+    p { margin-bottom: 10px; }
+    textarea { width: 100%; min-height: 100px; box-sizing: border-box; margin-bottom: 15px; font-family: monospace; border: 1px solid #ddd; border-radius: 4px; padding: 10px; }
+    button { padding: 10px 18px; background-color: #007bff; color: white; border: none; cursor: pointer; border-radius: 4px; font-size: 15px; transition: background-color 0.3s ease; margin-top:10px; }
+    button:hover { background-color: #0056b3; }
+    button:active { background-color: #004085; }
+    canvas { display: block; margin-top: 20px; border: 1px solid #aaa; background-color: #e9e9e9; border-radius: 4px; cursor: grab;}
+    canvas:active { cursor: grabbing; }
+    .warning { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; padding: 10px; border-radius: 4px; margin-bottom:15px; }
+    .input-group { margin-bottom: 15px; }
+    .input-group p { margin-bottom: 5px; font-weight: bold;}
+    input[type="file"] { margin-bottom: 5px; padding: 8px; border: 1px solid #ddd; border-radius: 4px; display: block; width: calc(100% - 18px); }
+    select { padding: 8px; border: 1px solid #ddd; border-radius: 4px; margin-top:5px; width: 100%; box-sizing: border-box; }
+    #legendContainer { margin-top: 15px; padding: 10px; background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; font-size: 0.9em;}
+    .legend-item { display: flex; align-items: center; margin-bottom: 5px; }
+    .legend-color-box { width: 20px; height: 20px; margin-right: 8px; border: 1px solid #ccc; }
+    #loadingIndicator { display: none; margin-top: 10px; font-style: italic; color: #555; }
+    #fileProgressContainer { margin-top: 10px; font-size: 0.9em; color: #333; }
+    .file-progress { margin-bottom: 3px; }
+
+</style>
+</head>
+<body>
+<div id="controlsContainer">
+<h2>WebGL2 MSH 文件查看器 (流式增量解析)</h2>
+<div class="warning">
+<strong>重要提示:</strong> 确保MSH文件包含所有被引用的节点坐标。RES文件中的节点ID应与MSH文件对应。
+    </div>
+<div class="input-group">
+<p>1. 选择MSH模型文件 (.msh):</p>
+<input accept=".msh, .txt" id="mshFileInput" type="file"/>
+<p style="font-weight:normal; font-size:0.9em; margin-top:2px;">或者在下方文本框粘贴MSH内容 (若选择文件，则优先使用文件):</p>
+<textarea id="mshInputTextArea" placeholder="在此处粘贴MSH文件内容..."></textarea>
+</div>
+<div class="input-group">
+<p>2. 选择结果文件 (.res) (可选):</p>
+<input accept=".res, .txt" id="resFileInput" type="file"/>
+</div>
+<div class="input-group">
+<p>3. 选择显示场 (加载RES文件后可用):</p>
+<select id="fieldSelector">
+<option value="default">默认着色</option>
+</select>
+</div>
+<button id="loadProcessButton">加载并处理文件</button>
+<div id="loadingIndicator">加载处理中，请稍候...</div>
+<div id="fileProgressContainer"></div>
+<div id="legendContainer" style="display: none;">
+<h4>图例 (基于节点值):</h4>
+<div class="legend-item"><div class="legend-color-box" style="background-color: rgb(255,0,0);"></div> <span id="legendMax">高</span></div>
+<div class="legend-item"><div class="legend-color-box" style="background: linear-gradient(to bottom, rgb(255,0,0), rgb(255,255,0), rgb(0,255,0));"></div> (过渡)</div>
+<div class="legend-item"><div class="legend-color-box" style="background-color: rgb(0,255,0);"></div> <span id="legendMin">低</span></div>
+</div>
+</div>
+<canvas height="600" id="glCanvas" width="800"></canvas>
+<script id="dataProcessorWorker" type="text/worker-script">
+    // --- START WORKER SCRIPT --- //
+    
+    // --- 颜色生成函数 ---
+    // 根据一个归一化后的值（0到1之间）生成一个从绿到红的颜色
+    function getScalarColor(normalizedScalar) {
+        let r, g, b;
+        normalizedScalar = Math.max(0, Math.min(1, normalizedScalar)); 
+        if (normalizedScalar < 0.5) { 
+            const t = normalizedScalar * 2; 
+            r = t; g = 1; b = 0;          
+        } else { 
+            const t = (normalizedScalar - 0.5) * 2; 
+            r = 1; g = 1 - t; b = 0;          
+        }
+        return [r, g, b];
+    }
+    
+    // --- 增量解析器基类 ---
+    class IncrementalParser {
+        constructor() {
+            this.decoder = new TextDecoder('utf-8', { stream: true });
+            this.incompleteLine = "";
+        }
+        processChunk(chunkData, isLastChunk) {
+            const textChunk = this.decoder.decode(chunkData, { stream: !isLastChunk });
+            const lines = (this.incompleteLine + textChunk).split(/\r?\n/);
+            this.incompleteLine = isLastChunk ? "" : lines.pop(); 
+
+            for (const line of lines) {
+                this.processLine(line.trim());
+            }
+
+            if(isLastChunk) {
+                this.finalize();
+            }
+        }
+        processLine(line) { /* 由子类实现 */ }
+        finalize() { /* 由子类实现 */ }
+        getResult() { /* 由子类实现 */ }
+    }
+
+    // --- MSH文件增量解析器 ---
+    class MSHParser extends IncrementalParser {
+        constructor() {
+            super();
+            this.rawCoordsMap = new Map(); 
+            this.elementLists = {
+                hexahedra: [], quadrilateral: [], tetrahedra: [], triangle: []
+            };
+            this.readingState = null;
+            this.currentElemType = null;
+            this.dimension = 3;
+        }
+
+        processLine(line) {
+            if (!line || line.startsWith('$') || line.startsWith('#')) return;
+            const parts = line.split(/\s+/);
+            
+            if (line.toLowerCase().includes("mesh")) {
+                const dimMatch = line.match(/Dimension\s+(\d+)/i);
+                if (dimMatch) this.dimension = parseInt(dimMatch[1], 10);
+                
+                const typeMatch = line.match(/Elemtype\s+(\w+)/i);
+                if(typeMatch) this.currentElemType = typeMatch[1].toLowerCase();
+
+            } else if (line.toLowerCase() === "coordinates") { this.readingState = "coordinates"; }
+            else if (line.toLowerCase() === "end coordinates") { this.readingState = null; }
+            else if (line.toLowerCase() === "elements") { 
+                this.readingState = "elements"; 
+                const typeMatch = line.match(/Elemtype\s+(\w+)/i);
+                if(typeMatch) this.currentElemType = typeMatch[1].toLowerCase();
+            }
+            else if (line.toLowerCase() === "end elements") { this.readingState = null; }
+            else if (this.readingState === "coordinates") {
+                if (this.dimension === 2 && parts.length >= 3) {
+                    const id = parseInt(parts[0]);
+                    const x = parseFloat(parts[1]);
+                    const y = parseFloat(parts[2]);
+                    if (![id, x, y].some(isNaN)) {
+                        this.rawCoordsMap.set(id, {x, y, z: 0.0}); // 2D数据自动添加Z=0
+                    }
+                } else if (this.dimension === 3 && parts.length >= 4) {
+                    const id = parseInt(parts[0]);
+                    const [x,y,z] = parts.slice(1,4).map(parseFloat);
+                    if (![id,x,y,z].some(isNaN)) this.rawCoordsMap.set(id, {x,y,z});
+                }
+            } else if (this.readingState === "elements" && this.currentElemType) {
+                 if (this.currentElemType === "hexahedra" && parts.length >= 9) this.elementLists.hexahedra.push(parts.slice(1,9).map(Number));
+                 else if (this.currentElemType === "quadrilateral" && parts.length >= 5) this.elementLists.quadrilateral.push(parts.slice(1,5).map(Number));
+                 else if (this.currentElemType === "tetrahedra" && parts.length >= 5) this.elementLists.tetrahedra.push(parts.slice(1,5).map(Number));
+                 else if (this.currentElemType === "triangle" && parts.length >= 4) this.elementLists.triangle.push(parts.slice(1,4).map(Number));
+            }
+        }
+
+        getResult() {
+            const rawFaceData = [];
+            const { hexahedra, quadrilateral, tetrahedra, triangle } = this.elementLists;
+
+            hexahedra.forEach(elNodeIds => { 
+                const pCoords = elNodeIds.map(id => this.rawCoordsMap.get(id));
+                if (pCoords.some(c => !c)) { return; }
+                const faceVIdx = [[0,1,5,4], [1,2,6,5], [2,3,7,6], [3,0,4,7], [4,5,6,7], [0,3,2,1]];
+                faceVIdx.forEach(fvi => {
+                    const n = fvi.map(i => elNodeIds[i]), c = fvi.map(i => pCoords[i]);
+                    rawFaceData.push({nodeOriginalIds:[n[0],n[1],n[2]], coords:[c[0],c[1],c[2]]});
+                    rawFaceData.push({nodeOriginalIds:[n[0],n[2],n[3]], coords:[c[0],c[2],c[3]]});
+                });
+            });
+            quadrilateral.forEach(elNodeIds => { 
+                const pCoords = elNodeIds.map(id => this.rawCoordsMap.get(id));
+                if (pCoords.some(c => !c)) { return; }
+                rawFaceData.push({nodeOriginalIds:[elNodeIds[0],elNodeIds[1],elNodeIds[2]], coords:[pCoords[0],pCoords[1],pCoords[2]]});
+                rawFaceData.push({nodeOriginalIds:[elNodeIds[0],elNodeIds[2],elNodeIds[3]], coords:[pCoords[0],pCoords[2],pCoords[3]]});
+            });
+            tetrahedra.forEach(elNodeIds => {
+                const pCoords = elNodeIds.map(id => this.rawCoordsMap.get(id));
+                if (pCoords.some(c => !c)) { return; }
+                const n0=elNodeIds[0], n1=elNodeIds[1], n2=elNodeIds[2], n3=elNodeIds[3];
+                const c0=pCoords[0], c1=pCoords[1], c2=pCoords[2], c3=pCoords[3];
+                rawFaceData.push({nodeOriginalIds:[n0,n1,n2], coords:[c0,c1,c2]});
+                rawFaceData.push({nodeOriginalIds:[n0,n2,n3], coords:[c0,c2,c3]});
+                rawFaceData.push({nodeOriginalIds:[n0,n3,n1], coords:[c0,c3,c1]});
+                rawFaceData.push({nodeOriginalIds:[n1,n3,n2], coords:[c1,c3,c2]}); 
+            });
+            triangle.forEach(elNodeIds => {
+                const pCoords = elNodeIds.map(id => this.rawCoordsMap.get(id));
+                if (pCoords.some(c => !c)) { return; }
+                rawFaceData.push({nodeOriginalIds:[elNodeIds[0],elNodeIds[1],elNodeIds[2]], coords:[pCoords[0],pCoords[1],pCoords[2]]});
+            });
+
+            return { rawFaceData, originalCoordsMap: this.rawCoordsMap };
+        }
+    }
+    
+    // --- RES文件增量解析器 ---
+    class ResParser extends IncrementalParser {
+         constructor() {
+            super();
+            this.results = [];
+            this.currentResult = null;
+            this.readingValues = false;
+        }
+
+        processLine(line) {
+             if (line.toLowerCase().startsWith('result')) {
+                this.readingValues = false;
+                const resultHeaderRegex = new RegExp('Result\\s+"([^"]+)"\\s+"([^"]+)"\\s+([0-9eE.+-]+)\\s+(\\w+)\\s+OnNodes', 'i'); 
+                const match = line.match(resultHeaderRegex);
+                if (match) {
+                    this.currentResult = {
+                        name: match[1], analysis: match[2], step: parseFloat(match[3]),
+                        type: match[4].toLowerCase(), location: "OnNodes",
+                        componentNames: [], nodeData: new Map() 
+                    };
+                    this.results.push(this.currentResult);
+                } else { this.currentResult = null; }
+            } else if (this.currentResult && line.toLowerCase().startsWith('componentnames')) {
+                this.currentResult.componentNames = line.substring('componentnames'.length).trim().split(new RegExp('\\s+')).map(name => name.replace(/"/g, ''));
+            } else if (this.currentResult && line.toLowerCase() === 'values') {
+                this.readingValues = true;
+            } else if (line.toLowerCase() === 'end values') {
+                this.readingValues = false; this.currentResult = null; 
+            } else if (this.currentResult && this.readingValues) {
+                const parts = line.split(new RegExp('\\s+'));
+                const nodeId = parseInt(parts[0]);
+                if (!isNaN(nodeId) && parts.length > this.currentResult.componentNames.length) {
+                    const values = parts.slice(1, 1 + this.currentResult.componentNames.length).map(parseFloat);
+                    if (values.every(v => !isNaN(v))) {
+                        this.currentResult.nodeData.set(nodeId, values);
+                    }
+                }
+            }
+        }
+
+        getResult() {
+            const availableScalarFields = [{displayName: "默认着色 (深度)", internalName: "default"}];
+            const addedFields = new Set(); // 使用Set来跟踪已添加的字段，避免重复
+
+            this.results.forEach(res => {
+                const addField = (displayName, internalName) => {
+                    if (!addedFields.has(internalName)) {
+                        availableScalarFields.push({ displayName, internalName });
+                        addedFields.add(internalName);
+                    }
+                };
+                
+                // *** FIX: Added handler for "scalar" type results ***
+                if (res.type === "scalar" && res.componentNames.length >= 1) { 
+                     res.componentNames.forEach((compName) => {
+                        addField(res.name + ' - ' + compName, res.name + '/' + compName);
+                    });
+                }
+                else if (res.type === "vector" && res.componentNames.length >= 1) { 
+                    res.componentNames.forEach((compName) => {
+                         addField(res.name + ' - ' + compName, res.name + '/' + compName);
+                    });
+                    if (res.componentNames.length === 3) { 
+                         addField(res.name + ' - Magnitude', res.name + '/Magnitude');
+                    }
+                } else if (res.type === "matrix" && res.componentNames.length === 6) { 
+                    res.componentNames.forEach((compName) => {
+                        addField(res.name + ' - ' + compName, res.name + '/' + compName);
+                    });
+                    addField(res.name + ' - VonMises', res.name + '/VonMises');
+                }
+            });
+            return { results: this.results, availableScalarFields };
+        }
+    }
+    // --- END PARSER CLASSES ---
+
+    // --- 准备渲染数据 (核心着色逻辑) ---
+    function prepareRenderData(rawFaceData, originalCoordsMap, parsedResDataContainer, selectedFieldName) {
+        const numFaces = rawFaceData.length;
+        const floatsPerVertex = 6; 
+        const verticesPerFace = 3;
+        const expectedTotalVertexFloats = numFaces * verticesPerFace * floatsPerVertex;
+        const expectedTotalTriangleIndices = numFaces * 3;
+        
+        let finalFlatVerticesWithColors;
+        let finalTriangleIndices;
+        
+        try {
+            finalFlatVerticesWithColors = new Float32Array(expectedTotalVertexFloats);
+            finalTriangleIndices = new Uint32Array(expectedTotalTriangleIndices);
+        } catch(e) {
+             throw new Error(
+                '创建顶点或索引 TypedArray 失败，预估大小过大。顶点元素: ' + expectedTotalVertexFloats + 
+                ', 三角形索引: ' + expectedTotalTriangleIndices + '. 原始错误: ' + e.message
+            );
+        }
+        
+        let currentVertexFloatIndex = 0;
+        let currentTriangleIndexPos = 0;
+        let currentVertexDataIndex = 0; 
+
+        let hasColors = false; 
+        let minGlobalNodeScalar = 0, maxGlobalNodeScalar = 1; 
+
+        // 检查是否选择了有效的RES显示场
+        if (selectedFieldName !== "default" && parsedResDataContainer && parsedResDataContainer.results) {
+            const [resultName, fieldSubName] = selectedFieldName.split('/');
+            const targetResult = parsedResDataContainer.results.find(r => r.name === resultName);
+
+            if (targetResult) {
+                const allNodeScalarValues = [];
+                const nodeIdsInGeometry = new Set();
+                rawFaceData.forEach(face => {
+                    face.nodeOriginalIds.forEach(id => nodeIdsInGeometry.add(id));
+                });
+
+                // 遍历模型中所有节点，计算其在选定场下的标量值，并找出最大最小值用于归一化
+                nodeIdsInGeometry.forEach(nodeId => {
+                    const nodeDataArray = targetResult.nodeData.get(nodeId);
+                    if (nodeDataArray) {
+                        let scalarVal;
+                        if (fieldSubName === "Magnitude" && targetResult.type === "vector" && nodeDataArray.length === 3) {
+                            scalarVal = Math.sqrt(nodeDataArray[0]**2 + nodeDataArray[1]**2 + nodeDataArray[2]**2);
+                        } else if (fieldSubName === "VonMises" && targetResult.type === "matrix" && nodeDataArray.length === 6) {
+                            const [sxx,syy,szz,syz,sxz,sxy] = nodeDataArray;
+                            const term1 = (sxx - syy)**2; const term2 = (syy - szz)**2; const term3 = (szz - sxx)**2;
+                            const term4 = 6 * (sxy**2 + syz**2 + sxz**2);
+                            scalarVal = Math.sqrt(0.5 * (term1 + term2 + term3 + term4));
+                        } else {
+                            const compIndex = targetResult.componentNames.indexOf(fieldSubName);
+                            if (compIndex !== -1) scalarVal = nodeDataArray[compIndex];
+                        }
+                        if (scalarVal !== undefined && !isNaN(scalarVal)) {
+                            allNodeScalarValues.push(scalarVal);
+                        }
+                    }
+                });
+
+                if (allNodeScalarValues.length > 0) {
+                    hasColors = true;
+                    minGlobalNodeScalar = allNodeScalarValues[0];
+                    maxGlobalNodeScalar = allNodeScalarValues[0];
+                    for (let i = 1; i < allNodeScalarValues.length; i++) {
+                        if (allNodeScalarValues[i] < minGlobalNodeScalar) minGlobalNodeScalar = allNodeScalarValues[i];
+                        if (allNodeScalarValues[i] > maxGlobalNodeScalar) maxGlobalNodeScalar = allNodeScalarValues[i];
+                    }
+                    if (minGlobalNodeScalar === maxGlobalNodeScalar) {
+                        maxGlobalNodeScalar += (maxGlobalNodeScalar === 0 ? 1 : Math.abs(maxGlobalNodeScalar * 0.001) + 0.00001);
+                    }
+                } else { hasColors = false; }
+            } else { hasColors = false; }
+        }
+        
+        // 遍历所有面片，为每个顶点计算颜色
+        rawFaceData.forEach((face) => {
+            face.coords.forEach((coord, vertexIndexInFace) => {
+                let vertexColor = [0.7, 0.7, 0.7]; // 默认颜色
+                
+                // 如果启用了颜色显示（即选择了有效的RES场）
+                if (hasColors && selectedFieldName !== "default") {
+                    const originalNodeId = face.nodeOriginalIds[vertexIndexInFace];
+                    let nodeScalarValue = 0; 
+                    const [resultName, fieldSubName] = selectedFieldName.split('/');
+                    const targetResult = parsedResDataContainer.results.find(r => r.name === resultName); 
+                    if (targetResult) {
+                        const nodeDataArray = targetResult.nodeData.get(originalNodeId);
+                        if (nodeDataArray) {
+                            // 根据场类型计算标量值
+                            if (fieldSubName === "Magnitude" && targetResult.type === "vector" && nodeDataArray.length === 3) {
+                                nodeScalarValue = Math.sqrt(nodeDataArray[0]**2 + nodeDataArray[1]**2 + nodeDataArray[2]**2);
+                            } else if (fieldSubName === "VonMises" && targetResult.type === "matrix" && nodeDataArray.length === 6) {
+                                const [sxx,syy,szz,syz,sxz,sxy] = nodeDataArray;
+                                const term1=(sxx-syy)**2; const term2=(syy-szz)**2; const term3=(szz-sxx)**2;
+                                const term4=6*((sxy**2)+(syz**2)+(sxz**2));
+                                nodeScalarValue = Math.sqrt(0.5*(term1+term2+term3+term4));
+                            } else {
+                                const compIndex = targetResult.componentNames.indexOf(fieldSubName);
+                                if (compIndex !== -1) nodeScalarValue = nodeDataArray[compIndex];
+                            }
+                            nodeScalarValue = (nodeScalarValue === undefined || isNaN(nodeScalarValue)) ? 0 : nodeScalarValue;
+                        }
+                    }
+                    // 将标量值归一化，并映射到颜色
+                    let normalizedNodeScalar = 0;
+                    if (maxGlobalNodeScalar > minGlobalNodeScalar) {
+                        normalizedNodeScalar = (nodeScalarValue - minGlobalNodeScalar) / (maxGlobalNodeScalar - minGlobalNodeScalar);
+                    } else if (maxGlobalNodeScalar === minGlobalNodeScalar && maxGlobalNodeScalar !== 0) {
+                        normalizedNodeScalar = 0.5; 
+                    }
+                    vertexColor = getScalarColor(normalizedNodeScalar);
+                }
+                // 将顶点数据（坐标 + 颜色）直接写入TypedArray
+                finalFlatVerticesWithColors[currentVertexFloatIndex++] = coord.x;
+                finalFlatVerticesWithColors[currentVertexFloatIndex++] = coord.y;
+                finalFlatVerticesWithColors[currentVertexFloatIndex++] = coord.z;
+                finalFlatVerticesWithColors[currentVertexFloatIndex++] = vertexColor[0];
+                finalFlatVerticesWithColors[currentVertexFloatIndex++] = vertexColor[1];
+                finalFlatVerticesWithColors[currentVertexFloatIndex++] = vertexColor[2];
+            });
+            finalTriangleIndices[currentTriangleIndexPos++] = currentVertexDataIndex;
+            finalTriangleIndices[currentTriangleIndexPos++] = currentVertexDataIndex + 1;
+            finalTriangleIndices[currentTriangleIndexPos++] = currentVertexDataIndex + 2;
+            currentVertexDataIndex += 3;
+        });
+
+        if (finalFlatVerticesWithColors.length > 0) { 
+            normalizeVertices(finalFlatVerticesWithColors, 6); 
+        }
+        
+        const finalLineIndices = new Uint32Array(finalTriangleIndices.length * 2);
+        let currentLineIndexPos = 0;
+        for (let i = 0; i < finalTriangleIndices.length; i += 3) {
+            finalLineIndices[currentLineIndexPos++] = finalTriangleIndices[i];
+            finalLineIndices[currentLineIndexPos++] = finalTriangleIndices[i+1];
+            finalLineIndices[currentLineIndexPos++] = finalTriangleIndices[i+1];
+            finalLineIndices[currentLineIndexPos++] = finalTriangleIndices[i+2];
+            finalLineIndices[currentLineIndexPos++] = finalTriangleIndices[i+2];
+            finalLineIndices[currentLineIndexPos++] = finalTriangleIndices[i];
+        }
+        
+        return { 
+            vertices: finalFlatVerticesWithColors, 
+            indices: finalTriangleIndices,        
+            lineIndices: finalLineIndices,
+            hasColors: hasColors,
+            minScalar: minGlobalNodeScalar, 
+            maxScalar: maxGlobalNodeScalar
+        };
+    }
+
+    function normalizeVertices(vertices, stride) { 
+        if (vertices.length === 0) return;
+        let minX = Infinity, minY = Infinity, minZ = Infinity;
+        let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+        for (let i = 0; i < vertices.length; i += stride) { 
+            minX = Math.min(minX, vertices[i]);
+            minY = Math.min(minY, vertices[i+1]);
+            minZ = Math.min(minZ, vertices[i+2]);
+            maxX = Math.max(maxX, vertices[i]);
+            maxY = Math.max(maxY, vertices[i+1]);
+            maxZ = Math.max(maxZ, vertices[i+2]);
+        }
+        const centerX = (minX + maxX) / 2;
+        const centerY = (minY + maxY) / 2;
+        const centerZ = (minZ + maxZ) / 2;
+        const extentX = maxX - minX;
+        const extentY = maxY - minY;
+        const extentZ = maxZ - minZ;
+        const maxExtent = Math.max(extentX, extentY, extentZ);
+        const scale = (maxExtent === 0) ? 1 : 2.0 / maxExtent; 
+        for (let i = 0; i < vertices.length; i += stride) { 
+            vertices[i]   = (vertices[i]   - centerX) * scale;
+            vertices[i+1] = (vertices[i+1] - centerY) * scale;
+            vertices[i+2] = (vertices[i+2] - centerZ) * scale;
+        }
+    }
+
+    // --- Web Worker Message Handler ---
+    let mshParser = null;
+    let resParser = null;
+
+    self.onmessage = function(e) {
+        const { type, fileType, chunkData, isLastChunk, mshBaseGeo, resDataContainer, field } = e.data;
+        
+        try {
+            if (type === 'start') {
+                if(fileType === 'msh') mshParser = new MSHParser();
+                if(fileType === 'res') resParser = new ResParser();
+            }
+            else if (type === 'fileChunk') {
+                if (fileType === 'msh' && mshParser) mshParser.processChunk(chunkData, isLastChunk);
+                else if (fileType === 'res' && resParser) resParser.processChunk(chunkData, isLastChunk);
+            } else if (type === 'processAllData') {
+                if (!mshParser && e.data.mshFromTextarea) {
+                    mshParser = new MSHParser();
+                    mshParser.processChunk(new TextEncoder().encode(e.data.mshFromTextarea), true);
+                }
+                
+                if (!mshParser) {
+                    throw new Error("MSH 数据未加载或解析器未初始化。");
+                }
+
+                const baseGeometry = mshParser.getResult();
+                const resData = resParser ? resParser.getResult() : null;
+                
+                mshParser = null; 
+                resParser = null;
+
+                self.postMessage({ 
+                    type: 'initialDataReady', 
+                    mshBaseGeo: baseGeometry, 
+                    resData: resData         
+                });
+
+            } else if (type === 'prepareRender') {
+                const finalRenderData = prepareRenderData(
+                    mshBaseGeo.rawFaceData, 
+                    mshBaseGeo.originalCoordsMap, 
+                    resDataContainer, 
+                    field
+                );
+                self.postMessage({ 
+                    type: 'renderDataReady', 
+                    renderData: finalRenderData 
+                }, [
+                    finalRenderData.vertices.buffer, 
+                    finalRenderData.indices.buffer, 
+                    finalRenderData.lineIndices.buffer
+                ]);
+            }
+        } catch (error) {
+            let errorMessage = error.message || '未知 Worker 错误';
+            if (error.stack && !errorMessage.includes('Worker Stack')) { 
+                errorMessage += '\\nWorker Stack: ' + error.stack.replace(/\\n/g, '\\n  ');
+            }
+            console.error('Worker onmessage caught error. Full Message: "' + errorMessage + '"', error);
+            self.postMessage({ type: 'error', error: errorMessage });
+        }
+    };
+</script>
+
+<script src="core.min.js"></script></body>
+</html>
